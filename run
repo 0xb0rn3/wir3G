@@ -1,10 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # wir3G - VPN Connection Manager
 # Dev: oxbv1 | 0xb0rn3
 # Repo: https://github.com/0xb0rn3/wir3G.git
 
-VERSION="1.0"
+VERSION="0.1"
+CONFIG_FILE="/etc/wir3G/config.json"
 
 # Colors
 RED='\033[0;31m'
@@ -64,6 +65,178 @@ check_deps() {
     fi
 }
 
+# Initialize config
+init_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        mkdir -p /etc/wir3G
+        echo '{"sessions":[]}' > "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+    fi
+}
+
+# Save session
+save_session() {
+    local vpn_type="$1"
+    local config_path="$2"
+    local username="$3"
+    local password="$4"
+    local timestamp=$(date +%s)
+    
+    init_config
+    
+    # Read existing config
+    local sessions=$(cat "$CONFIG_FILE" | grep -o '"sessions":\[.*\]' | sed 's/"sessions"://')
+    
+    # Create new session entry
+    local new_entry="{\"type\":\"$vpn_type\",\"config\":\"$config_path\",\"username\":\"$username\",\"password\":\"$password\",\"timestamp\":$timestamp}"
+    
+    # Add to sessions array
+    if [[ "$sessions" == "[]" ]]; then
+        sessions="[$new_entry]"
+    else
+        sessions=$(echo "$sessions" | sed "s/\]$/,$new_entry]/")
+    fi
+    
+    # Write back
+    echo "{\"sessions\":$sessions}" > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+}
+
+# Get last session
+get_last_session() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo ""
+        return
+    fi
+    
+    # Extract last session from JSON
+    local sessions=$(cat "$CONFIG_FILE" | grep -o '"sessions":\[.*\]')
+    if [[ "$sessions" == *"[]"* ]] || [[ -z "$sessions" ]]; then
+        echo ""
+        return
+    fi
+    
+    # Get last entry
+    local last=$(echo "$sessions" | grep -o '{[^}]*}' | tail -n1)
+    echo "$last"
+}
+
+# Parse session field
+get_session_field() {
+    local session="$1"
+    local field="$2"
+    echo "$session" | grep -o "\"$field\":\"[^\"]*\"" | cut -d'"' -f4
+}
+
+get_session_timestamp() {
+    local session="$1"
+    echo "$session" | grep -o '"timestamp":[0-9]*' | cut -d':' -f2
+}
+
+# Check if should reconnect
+check_reconnect() {
+    local last_session=$(get_last_session)
+    
+    if [[ -z "$last_session" ]]; then
+        return
+    fi
+    
+    local timestamp=$(get_session_timestamp "$last_session")
+    local vpn_type=$(get_session_field "$last_session" "type")
+    local config_path=$(get_session_field "$last_session" "config")
+    local current_time=$(date +%s)
+    local time_diff=$((current_time - timestamp))
+    
+    # If last session was within 24 hours
+    if [[ $time_diff -lt 86400 ]]; then
+        local hours=$((time_diff / 3600))
+        echo -e "${YELLOW}[?]${NC} Last session: $vpn_type ($hours hours ago)"
+        read -p "Reconnect? [y/N]: " reconnect
+        
+        if [[ "$reconnect" =~ ^[Yy]$ ]]; then
+            if [[ "$vpn_type" == "openvpn" ]]; then
+                local username=$(get_session_field "$last_session" "username")
+                local password=$(get_session_field "$last_session" "password")
+                reconnect_ovpn "$config_path" "$username" "$password"
+            else
+                reconnect_wg "$config_path"
+            fi
+            exit 0
+        fi
+    fi
+}
+
+# Reconnect OpenVPN with saved creds
+reconnect_ovpn() {
+    local config_path="$1"
+    local username="$2"
+    local password="$3"
+    
+    if [[ ! -f "$config_path" ]]; then
+        echo -e "${RED}[!]${NC} Previous config not found"
+        return
+    fi
+    
+    echo -e "${CYAN}[*]${NC} Reconnecting via OpenVPN..."
+    
+    pkill -9 openvpn 2>/dev/null
+    sleep 1
+    
+    # Create auth file if credentials exist
+    if [[ -n "$username" ]] && [[ -n "$password" ]]; then
+        local auth_file="/tmp/ovpn_auth_$$"
+        echo -e "$username\n$password" > "$auth_file"
+        chmod 600 "$auth_file"
+        openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon
+        sleep 2
+        rm -f "$auth_file"
+    else
+        openvpn --config "$config_path" --daemon
+    fi
+    
+    sleep 3
+    
+    if pgrep -x openvpn > /dev/null; then
+        local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
+        echo -e "${GREEN}[✓]${NC} Connected"
+        if [[ -n "$pub_ip" ]]; then
+            echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+        fi
+    else
+        echo -e "${RED}[!]${NC} Connection failed"
+    fi
+}
+
+# Reconnect WireGuard
+reconnect_wg() {
+    local config_path="$1"
+    
+    if [[ ! -f "$config_path" ]]; then
+        echo -e "${RED}[!]${NC} Previous config not found"
+        return
+    fi
+    
+    local filename=$(basename "$config_path")
+    local interface="${filename%.*}"
+    
+    echo -e "${CYAN}[*]${NC} Reconnecting via WireGuard..."
+    
+    wg-quick down "$interface" 2>/dev/null
+    sleep 1
+    
+    if wg-quick up "$interface" &>/dev/null; then
+        sleep 2
+        local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
+        echo -e "${GREEN}[✓]${NC} Connected"
+        echo -e "${GREEN}[✓]${NC} Interface: $interface"
+        if [[ -n "$pub_ip" ]]; then
+            echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+        fi
+    else
+        echo -e "${RED}[!]${NC} Connection failed"
+    fi
+}
+
 # OpenVPN connection
 connect_ovpn() {
     read -p "Config path: " config_path
@@ -73,21 +246,63 @@ connect_ovpn() {
         exit 1
     fi
     
+    # Check for saved credentials
+    local last_session=$(get_last_session)
+    local saved_user=""
+    local saved_pass=""
+    
+    if [[ -n "$last_session" ]]; then
+        local last_config=$(get_session_field "$last_session" "config")
+        if [[ "$last_config" == "$config_path" ]]; then
+            saved_user=$(get_session_field "$last_session" "username")
+            saved_pass=$(get_session_field "$last_session" "password")
+        fi
+    fi
+    
+    # Ask for credentials or use saved
+    local username="$saved_user"
+    local password="$saved_pass"
+    
+    if [[ -z "$username" ]]; then
+        read -p "Username (optional): " username
+        if [[ -n "$username" ]]; then
+            read -s -p "Password: " password
+            echo ""
+        fi
+    else
+        echo -e "${CYAN}[*]${NC} Using saved credentials for: $username"
+    fi
+    
     echo -e "${CYAN}[*]${NC} Connecting via OpenVPN..."
     
     # Kill existing instances
     pkill -9 openvpn 2>/dev/null
     sleep 1
     
-    # Start OpenVPN
-    openvpn --config "$config_path" --daemon
+    # Start OpenVPN with or without auth
+    if [[ -n "$username" ]] && [[ -n "$password" ]]; then
+        local auth_file="/tmp/ovpn_auth_$$"
+        echo -e "$username\n$password" > "$auth_file"
+        chmod 600 "$auth_file"
+        openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon
+        sleep 2
+        rm -f "$auth_file"
+    else
+        openvpn --config "$config_path" --daemon
+    fi
+    
     sleep 3
     
     # Verify connection
     if pgrep -x openvpn > /dev/null; then
-        local pub_ip=$(curl -s ifconfig.me)
+        local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
         echo -e "${GREEN}[✓]${NC} Connected"
-        echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+        if [[ -n "$pub_ip" ]]; then
+            echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+        fi
+        
+        # Save session
+        save_session "openvpn" "$config_path" "$username" "$password"
     else
         echo -e "${RED}[!]${NC} Connection failed"
         exit 1
@@ -151,6 +366,9 @@ connect_wg() {
         if [[ -n "$pub_ip" ]]; then
             echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
         fi
+        
+        # Save session
+        save_session "wireguard" "$config_path" "" ""
     else
         wg-quick down "$interface" 2>/dev/null
         echo -e "${RED}[!]${NC} Connection failed"
@@ -232,4 +450,5 @@ show_menu() {
 clear
 check_deps
 echo ""
+check_reconnect
 show_menu
