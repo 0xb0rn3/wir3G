@@ -1,39 +1,63 @@
 #!/bin/bash
 
-# Ensure the script is run with root privileges
+# 1. ROOT CHECK
+# Silently exit with error code if not root
 if [[ $EUID -ne 0 ]]; then
-   echo "Please run this script as root (sudo)."
+   echo "[ERROR NOT RUNNING]"
    exit 1
 fi
 
-# Ask for the configuration path
-read -p "Enter the full path to your .conf file: " CONFIG_PATH
+# 2. ASK FOR PATH
+read -p "Enter config path: " CONFIG_PATH
 
-# Check if file exists
+# 3. VALIDATE FILE
 if [[ ! -f "$CONFIG_PATH" ]]; then
-    echo "Error: File not found at $CONFIG_PATH"
+    echo "[ERROR NOT RUNNING]"
     exit 1
 fi
 
-# Extract filename without path and extension to use as interface name
+# 4. PREPARE ENVIRONMENT
 FILENAME=$(basename -- "$CONFIG_PATH")
 INTERFACE="${FILENAME%.*}"
+DEST_PATH="/etc/wireguard/$FILENAME"
 
-# Copy to /etc/wireguard if it's not already there
-if [[ "$CONFIG_PATH" != "/etc/wireguard/$FILENAME" ]]; then
-    cp "$CONFIG_PATH" "/etc/wireguard/"
-    chmod 600 "/etc/wireguard/$FILENAME"
-    echo "Config copied to /etc/wireguard/"
+# Ensure openresolv is present (Hard check for the specific failure you had)
+if ! command -v resolvconf >/dev/null 2>&1; then
+    # We can't fix it for you safely in a script, so we fail precisely
+    echo "[ERROR NOT RUNNING]"
+    exit 1
 fi
 
-# Enable and start the systemd service
-echo "Starting WireGuard interface: $INTERFACE in the background..."
-systemctl start "wg-quick@$INTERFACE"
+# Copy config
+if ! cp "$CONFIG_PATH" "$DEST_PATH" 2>/dev/null; then
+    echo "[ERROR NOT RUNNING]"
+    exit 1
+fi
+chmod 600 "$DEST_PATH"
 
-# Check if it started successfully
-if systemctl is-active --quiet "wg-quick@$INTERFACE"; then
-    echo "Successfully connected! Interface $INTERFACE is running."
-    echo "Run 'wg show' to see status."
+# 5. RESET & START
+# We stop the service AND manually delete the link to clear "File exists" errors
+systemctl stop "wg-quick@$INTERFACE" > /dev/null 2>&1
+ip link delete "$INTERFACE" > /dev/null 2>&1
+systemctl daemon-reload > /dev/null 2>&1
+
+# Attempt start
+systemctl start "wg-quick@$INTERFACE" > /dev/null 2>&1
+
+# 6. PRECISE VERIFICATION
+# We check three distinct success markers:
+# 1. Systemd says active
+# 2. Kernel says interface exists
+# 3. Interface has an IP address assigned
+IS_ACTIVE=$(systemctl is-active "wg-quick@$INTERFACE")
+HAS_LINK=$(ip link show "$INTERFACE" 2>/dev/null)
+HAS_IP=$(ip -4 addr show "$INTERFACE" 2>/dev/null)
+
+if [[ "$IS_ACTIVE" == "active" ]] && [[ -n "$HAS_LINK" ]] && [[ -n "$HAS_IP" ]]; then
+    # Using your specific spelling "SUCESS"
+    echo "[SUCESS RUNNING]"
 else
-    echo "Failed to start. Check 'journalctl -xeu wg-quick@$INTERFACE' for logs."
+    # If it failed, we try to clean up the dead interface so next run is clean
+    ip link delete "$INTERFACE" > /dev/null 2>&1
+    echo "[ERROR NOT RUNNING]"
 fi
