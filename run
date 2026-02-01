@@ -46,12 +46,12 @@ check_deps() {
         echo -e "${CYAN}[*]${NC} Installing dependencies..."
         
         if command -v apt &>/dev/null; then
-            apt update -qq
-            apt install -y "${missing[@]}"
+            apt update -qq &>/dev/null
+            apt install -y "${missing[@]}" &>/dev/null
         elif command -v dnf &>/dev/null; then
-            dnf install -y "${missing[@]}"
+            dnf install -y "${missing[@]}" &>/dev/null
         elif command -v pacman &>/dev/null; then
-            pacman -Sy --noconfirm "${missing[@]}"
+            pacman -Sy --noconfirm "${missing[@]}" &>/dev/null
         else
             echo -e "${RED}[!]${NC} Package manager not supported"
             echo -e "${YELLOW}[!]${NC} Install manually: ${missing[*]}"
@@ -105,12 +105,24 @@ connect_wg() {
     
     local filename=$(basename "$config_path")
     local interface="${filename%.*}"
+    
+    # Ensure .conf extension
+    if [[ ! "$filename" =~ \.conf$ ]]; then
+        filename="${interface}.conf"
+    fi
+    
     local dest_path="/etc/wireguard/$filename"
     
     echo -e "${CYAN}[*]${NC} Connecting via WireGuard..."
     
+    # Create wireguard directory if not exists
+    mkdir -p /etc/wireguard
+    
     # Copy config
-    cp "$config_path" "$dest_path" 2>/dev/null
+    if ! cp "$config_path" "$dest_path" 2>/dev/null; then
+        echo -e "${RED}[!]${NC} Failed to copy config"
+        exit 1
+    fi
     chmod 600 "$dest_path"
     
     # Stop existing connection
@@ -119,22 +131,28 @@ connect_wg() {
     ip link delete "$interface" 2>/dev/null
     sleep 1
     
-    # Start WireGuard
-    systemctl start "wg-quick@$interface"
+    # Start WireGuard using wg-quick directly
+    if wg-quick up "$interface" 2>&1 | grep -q "error\|failed"; then
+        echo -e "${RED}[!]${NC} WireGuard startup failed"
+        echo -e "${YELLOW}[!]${NC} Check: journalctl -xeu wg-quick@$interface"
+        exit 1
+    fi
+    
     sleep 2
     
     # Verify connection
-    local is_active=$(systemctl is-active "wg-quick@$interface")
     local has_link=$(ip link show "$interface" 2>/dev/null)
     local has_ip=$(ip -4 addr show "$interface" 2>/dev/null)
     
-    if [[ "$is_active" == "active" ]] && [[ -n "$has_link" ]] && [[ -n "$has_ip" ]]; then
-        local pub_ip=$(curl -s ifconfig.me)
+    if [[ -n "$has_link" ]] && [[ -n "$has_ip" ]]; then
+        local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
         echo -e "${GREEN}[✓]${NC} Connected"
         echo -e "${GREEN}[✓]${NC} Interface: $interface"
-        echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+        if [[ -n "$pub_ip" ]]; then
+            echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+        fi
     else
-        ip link delete "$interface" 2>/dev/null
+        wg-quick down "$interface" 2>/dev/null
         echo -e "${RED}[!]${NC} Connection failed"
         exit 1
     fi
