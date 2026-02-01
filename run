@@ -202,21 +202,26 @@ reconnect_ovpn() {
     pkill -9 openvpn 2>/dev/null
     sleep 1
     
-    # Create auth file if credentials exist
+    # Create auth file with credentials
     if [[ -n "$username" ]] && [[ -n "$password" ]]; then
         local auth_file="/tmp/ovpn_auth_$$"
-        echo -e "$username\n$password" > "$auth_file"
+        echo "$username" > "$auth_file"
+        echo "$password" >> "$auth_file"
         chmod 600 "$auth_file"
-        openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon
-        sleep 2
+        
+        # Start with auth file
+        openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon --log /tmp/ovpn.log
+        sleep 3
         rm -f "$auth_file"
     else
-        openvpn --config "$config_path" --daemon
+        echo -e "${YELLOW}[!]${NC} No saved credentials - manual auth required"
+        openvpn --config "$config_path" --daemon --log /tmp/ovpn.log
+        sleep 3
     fi
     
-    sleep 3
-    
+    # Verify connection
     if pgrep -x openvpn > /dev/null; then
+        sleep 2
         local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
         echo -e "${GREEN}[✓]${NC} Connected"
         if [[ -n "$pub_ip" ]]; then
@@ -224,6 +229,9 @@ reconnect_ovpn() {
         fi
     else
         echo -e "${RED}[!]${NC} Connection failed"
+        if [[ -f /tmp/ovpn.log ]]; then
+            echo -e "${YELLOW}[!]${NC} Check: cat /tmp/ovpn.log"
+        fi
     fi
 }
 
@@ -302,16 +310,16 @@ connect_ovpn() {
     # Start OpenVPN with or without auth
     if [[ -n "$username" ]] && [[ -n "$password" ]]; then
         local auth_file="/tmp/ovpn_auth_$$"
-        echo -e "$username\n$password" > "$auth_file"
+        echo "$username" > "$auth_file"
+        echo "$password" >> "$auth_file"
         chmod 600 "$auth_file"
-        openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon
-        sleep 2
+        openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon --log /tmp/ovpn.log
+        sleep 3
         rm -f "$auth_file"
     else
-        openvpn --config "$config_path" --daemon
+        openvpn --config "$config_path" --daemon --log /tmp/ovpn.log
+        sleep 3
     fi
-    
-    sleep 3
     
     # Verify connection
     if pgrep -x openvpn > /dev/null; then
@@ -325,6 +333,9 @@ connect_ovpn() {
         save_session "openvpn" "$config_path" "$username" "$password"
     else
         echo -e "${RED}[!]${NC} Connection failed"
+        if [[ -f /tmp/ovpn.log ]]; then
+            echo -e "${YELLOW}[!]${NC} Check: cat /tmp/ovpn.log"
+        fi
         exit 1
     fi
 }
