@@ -135,6 +135,26 @@ get_session_timestamp() {
 
 # Check if should reconnect
 check_reconnect() {
+    # Check if already connected
+    local ovpn_running=$(pgrep -x openvpn > /dev/null && echo "yes" || echo "no")
+    local wg_running=$(wg show interfaces 2>/dev/null)
+    
+    if [[ "$ovpn_running" == "yes" ]] || [[ -n "$wg_running" ]]; then
+        echo -e "${GREEN}[✓]${NC} Active session detected"
+        if [[ "$ovpn_running" == "yes" ]]; then
+            echo -e "${GREEN}[✓]${NC} OpenVPN: Running"
+        fi
+        if [[ -n "$wg_running" ]]; then
+            echo -e "${GREEN}[✓]${NC} WireGuard: Running ($wg_running)"
+        fi
+        local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
+        if [[ -n "$pub_ip" ]]; then
+            echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+        fi
+        echo ""
+        return
+    fi
+    
     local last_session=$(get_last_session)
     
     if [[ -z "$last_session" ]]; then
