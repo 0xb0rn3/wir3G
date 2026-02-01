@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# Ensure the script is run with root privileges
+if [[ $EUID -ne 0 ]]; then
+   echo "Please run this script as root (sudo)."
+   exit 1
+fi
+
+# Ask for the configuration path
+read -p "Enter the full path to your .conf file: " CONFIG_PATH
+
+# Check if file exists
+if [[ ! -f "$CONFIG_PATH" ]]; then
+    echo "Error: File not found at $CONFIG_PATH"
+    exit 1
+fi
+
+# Extract filename without path and extension to use as interface name
+FILENAME=$(basename -- "$CONFIG_PATH")
+INTERFACE="${FILENAME%.*}"
+
+# Copy to /etc/wireguard if it's not already there
+if [[ "$CONFIG_PATH" != "/etc/wireguard/$FILENAME" ]]; then
+    cp "$CONFIG_PATH" "/etc/wireguard/"
+    chmod 600 "/etc/wireguard/$FILENAME"
+    echo "Config copied to /etc/wireguard/"
+fi
+
+# Enable and start the systemd service
+echo "Starting WireGuard interface: $INTERFACE in the background..."
+systemctl start "wg-quick@$INTERFACE"
+
+# Check if it started successfully
+if systemctl is-active --quiet "wg-quick@$INTERFACE"; then
+    echo "Successfully connected! Interface $INTERFACE is running."
+    echo "Run 'wg show' to see status."
+else
+    echo "Failed to start. Check 'journalctl -xeu wg-quick@$INTERFACE' for logs."
+fi
