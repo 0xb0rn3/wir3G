@@ -24,7 +24,7 @@ fi
 check_deps() {
     local missing=()
     
-    echo -e "${CYAN}[*]${NC} Checking dependencies..."
+    echo -e "${CYAN}[◆]${NC} Checking dependencies..."
     
     # Check OpenVPN
     if ! command -v openvpn &>/dev/null; then
@@ -44,7 +44,7 @@ check_deps() {
     # Install missing packages
     if [ ${#missing[@]} -gt 0 ]; then
         echo -e "${YELLOW}[!]${NC} Missing: ${missing[*]}"
-        echo -e "${CYAN}[*]${NC} Installing dependencies..."
+        echo -e "${CYAN}[◆]${NC} Installing dependencies..."
         
         if command -v apt &>/dev/null; then
             apt update -qq &>/dev/null
@@ -84,8 +84,13 @@ save_session() {
     
     init_config
     
-    # Read existing config
-    local sessions=$(cat "$CONFIG_FILE" | grep -o '"sessions":\[.*\]' | sed 's/"sessions"://')
+    # Escape special characters for JSON
+    username=$(echo "$username" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    password=$(echo "$password" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    config_path=$(echo "$config_path" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    
+    # Read existing sessions
+    local sessions=$(grep -o '"sessions":\[.*\]' "$CONFIG_FILE" 2>/dev/null | sed 's/"sessions"://' || echo "[]")
     
     # Create new session entry
     local new_entry="{\"type\":\"$vpn_type\",\"config\":\"$config_path\",\"username\":\"$username\",\"password\":\"$password\",\"timestamp\":$timestamp}"
@@ -94,7 +99,13 @@ save_session() {
     if [[ "$sessions" == "[]" ]]; then
         sessions="[$new_entry]"
     else
-        sessions=$(echo "$sessions" | sed "s/\]$/,$new_entry]/")
+        # Remove trailing ] and add new entry
+        sessions="${sessions%]}"
+        if [[ "$sessions" == "[" ]]; then
+            sessions="[$new_entry]"
+        else
+            sessions="${sessions},$new_entry]"
+        fi
     fi
     
     # Write back
@@ -140,16 +151,18 @@ check_reconnect() {
     local wg_running=$(wg show interfaces 2>/dev/null)
     
     if [[ "$ovpn_running" == "yes" ]] || [[ -n "$wg_running" ]]; then
-        echo -e "${GREEN}[✓]${NC} Active session detected"
+        echo -e "${GREEN}┌─────────────────────────────────────┐${NC}"
+        echo -e "${GREEN}│  Active VPN Session Detected        │${NC}"
+        echo -e "${GREEN}└─────────────────────────────────────┘${NC}"
         if [[ "$ovpn_running" == "yes" ]]; then
-            echo -e "${GREEN}[✓]${NC} OpenVPN: Running"
+            echo -e "  ${GREEN}●${NC} OpenVPN: Running"
         fi
         if [[ -n "$wg_running" ]]; then
-            echo -e "${GREEN}[✓]${NC} WireGuard: Running ($wg_running)"
+            echo -e "  ${GREEN}●${NC} WireGuard: $wg_running"
         fi
         local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
         if [[ -n "$pub_ip" ]]; then
-            echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+            echo -e "  ${CYAN}◆${NC} Public IP: ${YELLOW}$pub_ip${NC}"
         fi
         echo ""
         return
@@ -183,6 +196,7 @@ check_reconnect() {
             fi
             exit 0
         fi
+        echo ""
     fi
 }
 
@@ -197,10 +211,12 @@ reconnect_ovpn() {
         return
     fi
     
-    echo -e "${CYAN}[*]${NC} Reconnecting via OpenVPN..."
+    echo -e "${CYAN}[◆]${NC} Reconnecting via OpenVPN..."
     
     pkill -9 openvpn 2>/dev/null
     sleep 1
+    
+    local log_file="/tmp/ovpn_reconnect_$$.log"
     
     # Create auth file with credentials
     if [[ -n "$username" ]] && [[ -n "$password" ]]; then
@@ -210,18 +226,38 @@ reconnect_ovpn() {
         chmod 600 "$auth_file"
         
         # Start with auth file
-        openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon --log /tmp/ovpn.log
-        sleep 3
+        openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon --log "$log_file"
         rm -f "$auth_file"
     else
-        echo -e "${YELLOW}[!]${NC} No saved credentials - manual auth required"
-        openvpn --config "$config_path" --daemon --log /tmp/ovpn.log
-        sleep 3
+        openvpn --config "$config_path" --daemon --log "$log_file"
     fi
     
+    # Wait and monitor log for success
+    echo -e "${CYAN}[◆]${NC} Waiting for connection..."
+    local success="no"
+    local attempts=0
+    
+    while [[ $attempts -lt 15 ]]; do
+        sleep 1
+        ((attempts++))
+        
+        if [[ -f "$log_file" ]]; then
+            if grep -q "Initialization Sequence Completed" "$log_file" 2>/dev/null; then
+                success="yes"
+                break
+            fi
+            
+            if grep -q "AUTH_FAILED\|auth-failure" "$log_file" 2>/dev/null; then
+                echo -e "${RED}[!]${NC} Authentication failed"
+                pkill -9 openvpn 2>/dev/null
+                rm -f "$log_file"
+                return
+            fi
+        fi
+    done
+    
     # Verify connection
-    if pgrep -x openvpn > /dev/null; then
-        sleep 2
+    if [[ "$success" == "yes" ]] && pgrep -x openvpn > /dev/null; then
         local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
         echo -e "${GREEN}[✓]${NC} Connected"
         if [[ -n "$pub_ip" ]]; then
@@ -229,10 +265,13 @@ reconnect_ovpn() {
         fi
     else
         echo -e "${RED}[!]${NC} Connection failed"
-        if [[ -f /tmp/ovpn.log ]]; then
-            echo -e "${YELLOW}[!]${NC} Check: cat /tmp/ovpn.log"
+        if [[ -f "$log_file" ]]; then
+            echo -e "${YELLOW}[!]${NC} Check: cat $log_file"
         fi
+        pkill -9 openvpn 2>/dev/null
     fi
+    
+    rm -f "$log_file"
 }
 
 # Reconnect WireGuard
@@ -247,7 +286,7 @@ reconnect_wg() {
     local filename=$(basename "$config_path")
     local interface="${filename%.*}"
     
-    echo -e "${CYAN}[*]${NC} Reconnecting via WireGuard..."
+    echo -e "${CYAN}[◆]${NC} Reconnecting via WireGuard..."
     
     wg-quick down "$interface" 2>/dev/null
     sleep 1
@@ -274,70 +313,118 @@ connect_ovpn() {
         exit 1
     fi
     
-    # Check for saved credentials
-    local last_session=$(get_last_session)
-    local saved_user=""
-    local saved_pass=""
-    
-    if [[ -n "$last_session" ]]; then
-        local last_config=$(get_session_field "$last_session" "config")
-        if [[ "$last_config" == "$config_path" ]]; then
-            saved_user=$(get_session_field "$last_session" "username")
-            saved_pass=$(get_session_field "$last_session" "password")
-        fi
-    fi
-    
-    # Ask for credentials or use saved
-    local username="$saved_user"
-    local password="$saved_pass"
-    
-    if [[ -z "$username" ]]; then
-        read -p "Username (optional): " username
-        if [[ -n "$username" ]]; then
-            read -s -p "Password: " password
-            echo ""
-        fi
-    else
-        echo -e "${CYAN}[*]${NC} Using saved credentials for: $username"
-    fi
-    
-    echo -e "${CYAN}[*]${NC} Connecting via OpenVPN..."
+    echo -e "${CYAN}[◆]${NC} Connecting via OpenVPN..."
     
     # Kill existing instances
     pkill -9 openvpn 2>/dev/null
     sleep 1
     
-    # Start OpenVPN with or without auth
-    if [[ -n "$username" ]] && [[ -n "$password" ]]; then
-        local auth_file="/tmp/ovpn_auth_$$"
-        echo "$username" > "$auth_file"
-        echo "$password" >> "$auth_file"
-        chmod 600 "$auth_file"
-        openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon --log /tmp/ovpn.log
-        sleep 3
-        rm -f "$auth_file"
-    else
-        openvpn --config "$config_path" --daemon --log /tmp/ovpn.log
-        sleep 3
-    fi
+    local log_file="/tmp/ovpn_$$.log"
+    local username=""
+    local password=""
     
-    # Verify connection
-    if pgrep -x openvpn > /dev/null; then
+    # First attempt - try without auth
+    openvpn --config "$config_path" --daemon --log "$log_file" 2>&1
+    
+    # Monitor log for auth requirement or success
+    local attempts=0
+    local needs_auth="no"
+    local success="no"
+    
+    echo -e "${CYAN}[◆]${NC} Waiting for connection..."
+    
+    while [[ $attempts -lt 20 ]]; do
+        sleep 1
+        ((attempts++))
+        
+        if [[ -f "$log_file" ]]; then
+            # Check for auth requirement
+            if grep -q "AUTH.*username.*password\|auth-user-pass" "$log_file" 2>/dev/null && [[ "$needs_auth" == "no" ]]; then
+                needs_auth="yes"
+                
+                # Kill the current attempt
+                pkill -9 openvpn 2>/dev/null
+                sleep 1
+                
+                # Check for saved credentials
+                local last_session=$(get_last_session)
+                if [[ -n "$last_session" ]]; then
+                    local last_config=$(get_session_field "$last_session" "config")
+                    if [[ "$last_config" == "$config_path" ]]; then
+                        username=$(get_session_field "$last_session" "username")
+                        password=$(get_session_field "$last_session" "password")
+                    fi
+                fi
+                
+                # Prompt for credentials if not saved
+                if [[ -z "$username" ]]; then
+                    echo ""
+                    read -p "Username: " username
+                    read -s -p "Password: " password
+                    echo ""
+                else
+                    echo -e "${CYAN}[◆]${NC} Using saved credentials for: $username"
+                fi
+                
+                # Restart with auth
+                local auth_file="/tmp/ovpn_auth_$$"
+                echo "$username" > "$auth_file"
+                echo "$password" >> "$auth_file"
+                chmod 600 "$auth_file"
+                
+                > "$log_file"  # Clear log
+                openvpn --config "$config_path" --auth-user-pass "$auth_file" --daemon --log "$log_file"
+                rm -f "$auth_file"
+                
+                attempts=0  # Reset counter for auth attempt
+                continue
+            fi
+            
+            # Check for success
+            if grep -q "Initialization Sequence Completed" "$log_file" 2>/dev/null; then
+                success="yes"
+                break
+            fi
+            
+            # Check for auth failure
+            if grep -q "AUTH_FAILED\|auth-failure\|authentication failed" "$log_file" 2>/dev/null; then
+                echo -e "${RED}[!]${NC} Authentication failed"
+                pkill -9 openvpn 2>/dev/null
+                rm -f "$log_file"
+                exit 1
+            fi
+            
+            # Check for other failures
+            if grep -q "Exiting due to fatal error" "$log_file" 2>/dev/null; then
+                echo -e "${RED}[!]${NC} Connection failed"
+                echo -e "${YELLOW}[!]${NC} Check: cat $log_file"
+                pkill -9 openvpn 2>/dev/null
+                exit 1
+            fi
+        fi
+    done
+    
+    # Verify final connection status
+    if [[ "$success" == "yes" ]] && pgrep -x openvpn > /dev/null; then
         local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
         echo -e "${GREEN}[✓]${NC} Connected"
         if [[ -n "$pub_ip" ]]; then
             echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
         fi
         
-        # Save session
+        # Save session only after successful connection
         save_session "openvpn" "$config_path" "$username" "$password"
     else
-        echo -e "${RED}[!]${NC} Connection failed"
-        if [[ -f /tmp/ovpn.log ]]; then
-            echo -e "${YELLOW}[!]${NC} Check: cat /tmp/ovpn.log"
+        echo -e "${RED}[!]${NC} Connection timeout"
+        if [[ -f "$log_file" ]]; then
+            echo -e "${YELLOW}[!]${NC} Check: cat $log_file"
         fi
+        pkill -9 openvpn 2>/dev/null
         exit 1
     fi
+    
+    # Cleanup log after successful connection
+    rm -f "$log_file"
 }
 
 # WireGuard connection
@@ -359,7 +446,7 @@ connect_wg() {
     
     local dest_path="/etc/wireguard/$filename"
     
-    echo -e "${CYAN}[*]${NC} Connecting via WireGuard..."
+    echo -e "${CYAN}[◆]${NC} Connecting via WireGuard..."
     
     # Create wireguard directory if not exists
     mkdir -p /etc/wireguard
@@ -409,70 +496,375 @@ connect_wg() {
 
 # Disconnect
 disconnect_vpn() {
-    echo -e "${CYAN}[*]${NC} Disconnecting..."
+    echo ""
+    echo -e "${CYAN}[◆]${NC} Disconnecting VPN..."
     
     # Kill OpenVPN
-    pkill -9 openvpn 2>/dev/null
+    if pgrep -x openvpn > /dev/null; then
+        pkill -9 openvpn 2>/dev/null
+        echo -e "  ${GREEN}●${NC} OpenVPN stopped"
+    fi
     
     # Stop WireGuard
-    for iface in $(wg show interfaces); do
+    local wg_stopped=0
+    for iface in $(wg show interfaces 2>/dev/null); do
         wg-quick down "$iface" 2>/dev/null
         systemctl stop "wg-quick@$iface" 2>/dev/null
         ip link delete "$iface" 2>/dev/null
+        echo -e "  ${GREEN}●${NC} WireGuard ($iface) stopped"
+        wg_stopped=1
     done
     
     sleep 1
-    echo -e "${GREEN}[✓]${NC} Disconnected"
+    
+    if ! pgrep -x openvpn > /dev/null && [[ -z "$(wg show interfaces 2>/dev/null)" ]]; then
+        echo ""
+        echo -e "${GREEN}[✓]${NC} All VPN connections closed"
+    else
+        echo -e "${YELLOW}[!]${NC} Some connections may still be active"
+    fi
+    echo ""
 }
 
 # Status check
 check_status() {
-    echo -e "${CYAN}[*]${NC} VPN Status:"
+    echo ""
+    echo -e "${CYAN}┌─────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│         VPN Status Check            │${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────┘${NC}"
+    echo ""
     
     # Check OpenVPN
     if pgrep -x openvpn > /dev/null; then
-        echo -e "${GREEN}[✓]${NC} OpenVPN: Running"
+        echo -e "  ${GREEN}●${NC} OpenVPN: ${GREEN}Running${NC}"
     else
-        echo -e "${YELLOW}[-]${NC} OpenVPN: Not running"
+        echo -e "  ${YELLOW}○${NC} OpenVPN: ${YELLOW}Not running${NC}"
     fi
     
     # Check WireGuard
     local wg_ifaces=$(wg show interfaces 2>/dev/null)
     if [[ -n "$wg_ifaces" ]]; then
-        echo -e "${GREEN}[✓]${NC} WireGuard: Running ($wg_ifaces)"
+        echo -e "  ${GREEN}●${NC} WireGuard: ${GREEN}Running${NC} ($wg_ifaces)"
     else
-        echo -e "${YELLOW}[-]${NC} WireGuard: Not running"
+        echo -e "  ${YELLOW}○${NC} WireGuard: ${YELLOW}Not running${NC}"
     fi
     
     # Show public IP
+    echo ""
     local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
     if [[ -n "$pub_ip" ]]; then
-        echo -e "${CYAN}[*]${NC} Public IP: $pub_ip"
+        echo -e "  ${CYAN}◆${NC} Public IP: ${YELLOW}$pub_ip${NC}"
+    else
+        echo -e "  ${RED}◆${NC} Public IP: ${RED}Unable to fetch${NC}"
+    fi
+    echo ""
+}
+
+# VPNGate integration
+fetch_vpngate_servers() {
+    echo ""
+    echo -e "${CYAN}[◆]${NC} Fetching VPNGate servers..."
+    
+    local csv_file="/tmp/vpngate_$$.csv"
+    
+    if ! curl -s "https://www.vpngate.net/api/iphone/" -o "$csv_file" 2>/dev/null; then
+        echo -e "${RED}[!]${NC} Failed to fetch server list"
+        return 1
+    fi
+    
+    # Skip comment lines and header
+    tail -n +3 "$csv_file" > "${csv_file}.clean"
+    
+    echo -e "${GREEN}[✓]${NC} Server list downloaded"
+    echo ""
+    
+    # Display servers with better formatting
+    echo -e "${CYAN}┌─────────────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│                    Available VPNGate Servers                       │${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    
+    local count=1
+    local -a servers
+    
+    while IFS=',' read -r hostname ip score ping speed country_long country_short sessions uptime users traffic logtype operator message config_base64; do
+        if [[ -n "$hostname" ]] && [[ "$hostname" != "#HostName" ]]; then
+            # Convert speed to Mbps
+            local speed_mbps=$((speed / 1000000))
+            
+            printf "  ${GREEN}%2d${NC}) %-20s ${YELLOW}%-15s${NC} ${CYAN}%-3s${NC} %4d Mbps  Sessions: %d\n" \
+                "$count" "$country_long" "$ip" "$country_short" "$speed_mbps" "$sessions"
+            
+            servers[$count]="$hostname,$ip,$country_short,$config_base64"
+            ((count++))
+            
+            # Limit display to 20 servers
+            if [[ $count -gt 20 ]]; then
+                break
+            fi
+        fi
+    done < "${csv_file}.clean"
+    
+    echo ""
+    read -p "Select server (1-$((count-1))) or 0 to cancel: " selection
+    
+    if [[ "$selection" -eq 0 ]] || [[ -z "${servers[$selection]}" ]]; then
+        rm -f "$csv_file" "${csv_file}.clean"
+        return
+    fi
+    
+    # Extract selected server data
+    IFS=',' read -r hostname ip country config_base64 <<< "${servers[$selection]}"
+    
+    # Decode and save config
+    local config_file="/tmp/vpngate_${country}_${hostname}.ovpn"
+    echo "$config_base64" | base64 -d > "$config_file" 2>/dev/null
+    
+    if [[ ! -f "$config_file" ]] || [[ ! -s "$config_file" ]]; then
+        echo -e "${RED}[!]${NC} Failed to decode config"
+        rm -f "$csv_file" "${csv_file}.clean"
+        return
+    fi
+    
+    echo -e "${GREEN}[✓]${NC} Config saved: $config_file"
+    echo -e "${CYAN}[◆]${NC} Hostname: $hostname"
+    echo -e "${CYAN}[◆]${NC} IP: $ip"
+    echo -e "${CYAN}[◆]${NC} Country: $country"
+    echo ""
+    
+    read -p "Connect now? [y/N]: " connect_now
+    
+    if [[ "$connect_now" =~ ^[Yy]$ ]]; then
+        # Use the OpenVPN connection function
+        echo ""
+        echo -e "${CYAN}[◆]${NC} Connecting via OpenVPN..."
+        
+        pkill -9 openvpn 2>/dev/null
+        sleep 1
+        
+        local log_file="/tmp/ovpn_vpngate_$$.log"
+        openvpn --config "$config_file" --daemon --log "$log_file" 2>&1
+        
+        echo -e "${CYAN}[◆]${NC} Waiting for connection..."
+        local success="no"
+        local attempts=0
+        
+        while [[ $attempts -lt 15 ]]; do
+            sleep 1
+            ((attempts++))
+            
+            if [[ -f "$log_file" ]] && grep -q "Initialization Sequence Completed" "$log_file" 2>/dev/null; then
+                success="yes"
+                break
+            fi
+        done
+        
+        if [[ "$success" == "yes" ]] && pgrep -x openvpn > /dev/null; then
+            local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
+            echo -e "${GREEN}[✓]${NC} Connected to VPNGate"
+            if [[ -n "$pub_ip" ]]; then
+                echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+            fi
+            save_session "openvpn" "$config_file" "" ""
+        else
+            echo -e "${RED}[!]${NC} Connection failed"
+        fi
+        
+        rm -f "$log_file"
+    fi
+    
+    rm -f "$csv_file" "${csv_file}.clean"
+}
+
+# System-wide installation
+install_system() {
+    echo ""
+    echo -e "${CYAN}┌─────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│      System Installation            │${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "${YELLOW}[!]${NC} This will install wir3G to /usr/local/bin/"
+    read -p "Continue? [y/N]: " confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        return
+    fi
+    
+    # Get the script location
+    local script_path="$(readlink -f "$0")"
+    
+    # Copy to /usr/local/bin
+    if cp "$script_path" /usr/local/bin/wir3G 2>/dev/null; then
+        chmod +x /usr/local/bin/wir3G
+        echo -e "${GREEN}[✓]${NC} Installed to /usr/local/bin/wir3G"
+        echo -e "${GREEN}[✓]${NC} You can now run: ${CYAN}sudo wir3G${NC}"
+        echo ""
+    else
+        echo -e "${RED}[!]${NC} Installation failed"
+        echo -e "${YELLOW}[!]${NC} Try: sudo cp $script_path /usr/local/bin/wir3G"
+    fi
+}
+
+# Config builder
+build_config() {
+    clear
+    echo -e "${CYAN}"
+    echo "═══════════════════════════════════════"
+    echo "        CONFIG BUILDER"
+    echo "═══════════════════════════════════════${NC}"
+    echo ""
+    echo "1) WireGuard Config"
+    echo "2) OpenVPN Config"
+    echo "3) Back"
+    echo ""
+    read -p "Select: " build_choice
+    
+    case $build_choice in
+        1) build_wg_config ;;
+        2) build_ovpn_config ;;
+        3) return ;;
+        *) echo -e "${RED}[!]${NC} Invalid option" && return ;;
+    esac
+}
+
+# Build WireGuard config
+build_wg_config() {
+    echo ""
+    echo -e "${CYAN}[*]${NC} WireGuard Config Builder"
+    echo ""
+    
+    read -p "Private Key: " private_key
+    read -p "Address (e.g., 10.0.0.2/24): " address
+    read -p "DNS (e.g., 1.1.1.1): " dns
+    echo ""
+    read -p "Peer Public Key: " peer_public
+    read -p "Endpoint (e.g., vpn.server.com:51820): " endpoint
+    read -p "Allowed IPs (default: 0.0.0.0/0): " allowed_ips
+    allowed_ips=${allowed_ips:-0.0.0.0/0}
+    
+    local config_name="wir3g_$(date +%s).conf"
+    local config_path="/tmp/$config_name"
+    
+    cat > "$config_path" << EOF
+[Interface]
+PrivateKey = $private_key
+Address = $address
+DNS = $dns
+
+[Peer]
+PublicKey = $peer_public
+Endpoint = $endpoint
+AllowedIPs = $allowed_ips
+PersistentKeepalive = 25
+EOF
+    
+    chmod 600 "$config_path"
+    echo ""
+    echo -e "${GREEN}[✓]${NC} Config saved: $config_path"
+    read -p "Connect now? [y/N]: " connect_now
+    
+    if [[ "$connect_now" =~ ^[Yy]$ ]]; then
+        # Copy to wireguard directory
+        local filename=$(basename "$config_path")
+        local interface="${filename%.*}"
+        local dest_path="/etc/wireguard/$filename"
+        
+        mkdir -p /etc/wireguard
+        cp "$config_path" "$dest_path"
+        chmod 600 "$dest_path"
+        
+        echo -e "${CYAN}[*]${NC} Connecting via WireGuard..."
+        
+        wg-quick down "$interface" 2>/dev/null
+        sleep 1
+        
+        if wg-quick up "$interface" &>/dev/null; then
+            sleep 2
+            local pub_ip=$(curl -s ifconfig.me 2>/dev/null)
+            echo -e "${GREEN}[✓]${NC} Connected"
+            echo -e "${GREEN}[✓]${NC} Interface: $interface"
+            if [[ -n "$pub_ip" ]]; then
+                echo -e "${GREEN}[✓]${NC} Public IP: $pub_ip"
+            fi
+            save_session "wireguard" "$dest_path" "" ""
+        else
+            echo -e "${RED}[!]${NC} Connection failed"
+        fi
+    fi
+}
+
+# Build OpenVPN config
+build_ovpn_config() {
+    echo ""
+    echo -e "${CYAN}[*]${NC} OpenVPN Config Builder"
+    echo ""
+    
+    read -p "Remote server (e.g., vpn.server.com): " remote_server
+    read -p "Port (default: 1194): " port
+    port=${port:-1194}
+    read -p "Protocol [udp/tcp] (default: udp): " proto
+    proto=${proto:-udp}
+    
+    local config_name="wir3g_$(date +%s).ovpn"
+    local config_path="/tmp/$config_name"
+    
+    cat > "$config_path" << EOF
+client
+dev tun
+proto $proto
+remote $remote_server $port
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-CBC
+auth SHA256
+verb 3
+auth-user-pass
+EOF
+    
+    chmod 600 "$config_path"
+    echo ""
+    echo -e "${GREEN}[✓]${NC} Config saved: $config_path"
+    echo -e "${YELLOW}[!]${NC} Note: You'll need to add CA cert and keys manually"
+    read -p "Use this config now? [y/N]: " use_now
+    
+    if [[ "$use_now" =~ ^[Yy]$ ]]; then
+        echo -e "${CYAN}[*]${NC} Config path: $config_path"
     fi
 }
 
 # Menu
 show_menu() {
     echo -e "${CYAN}"
-    echo "╔══════════════════════════════╗"
-    echo "║         wir3G v$VERSION         ║"
-    echo "║   oxbv1 | 0xb0rn3            ║"
-    echo "╚══════════════════════════════╝${NC}"
+    echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+    echo "┃                                    ┃"
+    echo "┃            wir3G v${VERSION}             ┃"
+    echo "┃        oxbv1 | 0xb0rn3             ┃"
+    echo "┃                                    ┃"
+    echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛${NC}"
     echo ""
-    echo "1) OpenVPN"
-    echo "2) WireGuard"
-    echo "3) Disconnect"
-    echo "4) Status"
-    echo "5) Exit"
+    echo -e "  ${GREEN}1${NC}) OpenVPN Connection"
+    echo -e "  ${GREEN}2${NC}) WireGuard Connection"
+    echo -e "  ${GREEN}3${NC}) VPNGate (Free Servers)"
+    echo -e "  ${YELLOW}4${NC}) Disconnect VPN"
+    echo -e "  ${CYAN}5${NC}) Connection Status"
+    echo -e "  ${CYAN}6${NC}) Build Config"
+    echo -e "  ${CYAN}7${NC}) Install System-Wide"
+    echo -e "  ${RED}8${NC}) Exit"
     echo ""
-    read -p "Select: " choice
+    read -p "  → " choice
     
     case $choice in
         1) connect_ovpn ;;
         2) connect_wg ;;
-        3) disconnect_vpn ;;
-        4) check_status ;;
-        5) exit 0 ;;
+        3) fetch_vpngate_servers ;;
+        4) disconnect_vpn ;;
+        5) check_status ;;
+        6) build_config ;;
+        7) install_system ;;
+        8) exit 0 ;;
         *) echo -e "${RED}[!]${NC} Invalid option" && exit 1 ;;
     esac
 }
